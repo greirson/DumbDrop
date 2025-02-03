@@ -29,15 +29,14 @@ const apiLimiter = rateLimit({
     message: 'Too many requests from this IP, please try again later'
 });
 
-const uploadLimiter = rateLimit({
+const initUploadLimiter = rateLimit({
     windowMs: 60 * 60 * 1000, // 1 hour
-    max: 50, // Limit each IP to 50 upload requests per hour
-    message: 'Upload limit exceeded, please try again later'
+    max: 50, // Limit each IP to 50 new uploads per hour
+    message: 'Too many upload attempts, please try again later'
 });
 
 // Apply rate limiting to all API routes
 app.use('/api/', apiLimiter);
-app.use('/upload/', uploadLimiter);
 
 // Brute force protection setup
 const loginAttempts = new Map();  // Stores IP addresses and their attempt counts
@@ -260,7 +259,7 @@ app.use('/upload', requirePin);
 const uploads = new Map();
 
 // Routes
-app.post('/upload/init', async (req, res) => {
+app.post('/upload/init', initUploadLimiter, async (req, res) => {
     const { filename, fileSize } = req.body;
 
     const safeFilename = path.normalize(filename).replace(/^(\.\.(\/|\\|$))+/, '');
