@@ -57,7 +57,7 @@
     </style>
 
     <script>
-        const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+        const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
         const MAX_RETRIES = 3;
         const RETRY_DELAY = 1000;
 
@@ -68,6 +68,12 @@
                 this.position = 0;
                 this.progressElement = null;
                 this.retries = 0;
+                this.uploadTimeout = 30000; // 30 seconds timeout
+                this.lastProgressTime = Date.now();
+                this.concurrentChunks = 3; // Allow 3 concurrent chunk uploads
+                this.activeUploads = 0;
+                this.chunkQueue = [];
+                this.failed = false;
             }
 
             async start() {
@@ -108,18 +114,40 @@
 
             async uploadChunks() {
                 this.createProgressElement();
-
+                
+                // Create chunks
                 while (this.position < this.file.size) {
                     const chunk = await this.readChunk();
-                    try {
-                        await this.uploadChunk(chunk);
-                        this.retries = 0;
-                    } catch (error) {
-                        if (this.retries >= MAX_RETRIES) throw error;
-                        this.retries++;
-                        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
-                        continue;
+                    this.chunkQueue.push({
+                        chunk,
+                        position: this.position - chunk.byteLength
+                    });
+                }
+
+                // Process chunks with concurrency
+                while (this.chunkQueue.length > 0 && !this.failed) {
+                    while (this.activeUploads < this.concurrentChunks && this.chunkQueue.length > 0) {
+                        const chunkInfo = this.chunkQueue.shift();
+                        this.activeUploads++;
+                        
+                        this.uploadChunk(chunkInfo.chunk, chunkInfo.position)
+                            .catch(error => {
+                                console.error('Chunk upload error:', error);
+                                this.failed = true;
+                                this.chunkQueue = []; // Clear queue on failure
+                                throw error;
+                            })
+                            .finally(() => {
+                                this.activeUploads--;
+                            });
                     }
+                    
+                    // Wait a bit before checking again
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+
+                if (this.failed) {
+                    throw new Error('Upload failed');
                 }
             }
 
@@ -131,18 +159,63 @@
                 return await blob.arrayBuffer();
             }
 
-            async uploadChunk(chunk) {
-                const response = await fetch(`/upload/chunk/${this.uploadId}`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/octet-stream'
-                    },
-                    body: chunk
-                });
+            async uploadChunk(chunk, position) {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), this.uploadTimeout);
 
-                if (!response.ok) throw new Error('Chunk upload failed');
-                const data = await response.json();
-                this.updateProgress(data.progress);
+                try {
+                    const response = await fetch(`/upload/chunk/${this.uploadId}`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/octet-stream'
+                        },
+                        body: chunk,
+                        signal: controller.signal
+                    });
+
+                    clearTimeout(timeoutId);
+
+                    if (!response.ok) {
+                        // Handle rate limiting specifically
+                        if (response.status === 429) {
+                            // Get retry delay from response header, default to 5 seconds
+                            const retryAfter = response.headers.get('Retry-After');
+                            const delayMs = (retryAfter ? parseInt(retryAfter) : 5) * 1000;
+                            
+                            // Update UI to show waiting status
+                            if (this.progressElement) {
+                                this.progressElement.time.textContent = `Rate limited - retrying in ${Math.ceil(delayMs/1000)}s`;
+                            }
+                            
+                            // Wait for the specified delay
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+                            
+                            // Don't count rate limit responses against retry limit
+                            this.position = Math.max(0, this.position - chunk.byteLength);
+                            throw new Error('Rate limited - retrying');
+                        }
+
+                        // For other errors, try to parse error message
+                        let errorMessage = 'Chunk upload failed';
+                        try {
+                            const errorData = await response.json();
+                            errorMessage = errorData.error || errorMessage;
+                        } catch (e) {
+                            // If response isn't JSON, try to get text
+                            errorMessage = await response.text();
+                        }
+                        throw new Error(errorMessage);
+                    }
+
+                    const data = await response.json();
+                    this.updateProgress(data.progress);
+                } catch (error) {
+                    clearTimeout(timeoutId);
+                    if (error.name === 'AbortError') {
+                        throw new Error('Request timed out');
+                    }
+                    throw error;
+                }
             }
 
             createProgressElement() {
@@ -163,22 +236,101 @@
                 bar.className = 'progress-bar';
                 bar.style.width = '0%';
 
+                const stats = document.createElement('div');
+                stats.className = 'progress-stats';
+                stats.innerHTML = `
+                    <span class="progress-percentage">0%</span>
+                    <span class="progress-speed">0 MB/s</span>
+                    <span class="progress-time">Calculating...</span>
+                `;
+
                 progress.appendChild(bar);
                 container.appendChild(label);
                 container.appendChild(progress);
+                container.appendChild(stats);
                 
                 document.getElementById('uploadProgress').appendChild(container);
-                this.progressElement = { container, bar };
+                this.progressElement = { 
+                    container, 
+                    bar,
+                    percentage: stats.querySelector('.progress-percentage'),
+                    speed: stats.querySelector('.progress-speed'),
+                    time: stats.querySelector('.progress-time')
+                };
+
+                // Initialize timing data
+                this.lastUpdate = Date.now();
+                this.lastBytes = 0;
+                this.speedHistory = [];
             }
 
             updateProgress(percent) {
                 if (this.progressElement) {
+                    const now = Date.now();
+                    const timeDiff = (now - this.lastUpdate) / 1000; // Convert to seconds
+                    const bytesDiff = this.position - this.lastBytes;
+                    
+                    // Calculate speed (bytes per second)
+                    const currentSpeed = bytesDiff / timeDiff;
+                    
+                    // Keep a history of the last 5 speed measurements
+                    this.speedHistory.push(currentSpeed);
+                    if (this.speedHistory.length > 5) {
+                        this.speedHistory.shift();
+                    }
+                    
+                    // Calculate average speed
+                    const avgSpeed = this.speedHistory.reduce((a, b) => a + b, 0) / this.speedHistory.length;
+                    
+                    // Calculate time remaining
+                    const remainingBytes = this.file.size - this.position;
+                    const timeRemaining = avgSpeed > 0 ? remainingBytes / avgSpeed : 0;
+                    
+                    // Update progress bar and stats
                     this.progressElement.bar.style.width = `${percent}%`;
+                    this.progressElement.percentage.textContent = `${percent}%`;
+                    this.progressElement.speed.textContent = `${this.formatSpeed(avgSpeed)}`;
+                    this.progressElement.time.textContent = this.formatTimeRemaining(timeRemaining);
+
+                    // Store current values for next update
+                    this.lastUpdate = now;
+                    this.lastBytes = this.position;
+
                     if (percent === 100) {
                         setTimeout(() => {
                             this.progressElement.container.remove();
                         }, 1000);
                     }
+                }
+            }
+
+            formatSpeed(bytesPerSecond) {
+                const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+                let speed = bytesPerSecond;
+                let unitIndex = 0;
+                
+                while (speed >= 1024 && unitIndex < units.length - 1) {
+                    speed /= 1024;
+                    unitIndex++;
+                }
+                
+                return `${speed.toFixed(1)} ${units[unitIndex]}`;
+            }
+
+            formatTimeRemaining(seconds) {
+                if (!isFinite(seconds) || seconds === 0) return 'Calculating...';
+                if (seconds < 1) return 'Almost done...';
+                
+                const hours = Math.floor(seconds / 3600);
+                const minutes = Math.floor((seconds % 3600) / 60);
+                const secs = Math.floor(seconds % 60);
+                
+                if (hours > 0) {
+                    return `${hours}h ${minutes}m remaining`;
+                } else if (minutes > 0) {
+                    return `${minutes}m ${secs}s remaining`;
+                } else {
+                    return `${secs}s remaining`;
                 }
             }
         }
@@ -353,29 +505,33 @@
             uploadButton.disabled = true;
             document.getElementById('uploadProgress').innerHTML = '';
             
-            const groupedItems = groupFilesByFolder(files);
-            const results = await Promise.all(
-                groupedItems.map(async item => {
-                    let success = true;
-                    for (const file of item.files) {
-                        const uploader = new FileUploader(file);
-                        if (!await uploader.start()) {
-                            success = false;
-                        }
-                    }
-                    return success;
-                })
-            );
-
-            const successful = results.filter(r => r).length;
+            let successCount = 0;
+            let failCount = 0;
             
+            for (const item of groupFilesByFolder(files)) {
+                for (const file of item.files) {
+                    try {
+                        const uploader = new FileUploader(file);
+                        await uploader.start();
+                        successCount++;
+                    } catch (error) {
+                        console.error(`Failed to upload ${file.name}:`, error);
+                        failCount++;
+                        
+                        // Continue with other files even if one fails
+                        continue;
+                    }
+                }
+            }
+
+            // Show final status
             Toastify({
-                text: `Uploaded ${successful} of ${groupedItems.length} items`,
+                text: `Uploaded ${successCount} files${failCount > 0 ? `, ${failCount} failed` : ''}`,
                 duration: 3000,
                 gravity: "bottom",
                 position: "right",
                 style: {
-                    background: successful === groupedItems.length ? "#4CAF50" : "#f44336"
+                    background: failCount === 0 ? "#4CAF50" : "#f44336"
                 }
             }).showToast();
 
