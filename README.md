@@ -165,3 +165,7 @@ docker run -p 3000:3000 -v "${PWD}\local_uploads:/app/uploads" -e DUMBDROP_PIN=1
 - File handling: Chunked file uploads with configurable size limits
 - Security: Optional PIN protection for uploads
 - Containerization: Docker with automated builds via GitHub Actions
+
+## Development
+
+Want to contribute or develop locally? Check out our [Development Guide](dev/README.md) - it's stupid simple, just the way we like it! If you're writing complex code to solve a simple problem, you're probably doing it wrong. Keep it dumb, keep it simple.
