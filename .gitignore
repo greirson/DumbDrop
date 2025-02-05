@@ -150,3 +150,4 @@ Thumbs.db
 dev/*
 !dev/docker-compose.dev.yml
 !dev/dev.sh
+!dev/README.md
